@@ -1,0 +1,53 @@
+# Python __pycache__ і компіляція
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Віртуальні середовища
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+
+# IDE та редактори
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи
+logs/
+*.log
+
+# Секрети та конфіг
+.env
+.env.*
+*.secret
+*.key
+
+# Docker / Compose
+pgdata/
+*.pid
+
+# SQL — залишаємо вихідні файли, але ігноруємо тимчасові дампи/бекапи
+*.sql~
+*.dump
+*.bak
+*.backup
+*.DS_Store
+
+
+# OS специфічні файли
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Кеш тестів
+.tox/
+.nox/
+.coverage
+*.cover
+*.py,cover
+.cache
+.pytest_cache/

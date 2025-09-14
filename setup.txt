@@ -1,0 +1,17 @@
+docker run -d \
+  --name pg_dwh_openaq \
+  -p 5435:5432 \
+  -e POSTGRES_DB=pg_dwh_openaq \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=root \
+  -v pg_dwh_openaq_data:/var/lib/postgresql/data \
+  postgres:latest
+
+docker run -d --name pg_dwh_openaq -p 5435:5432 -e POSTGRES_DB=pg_dwh_openaq -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=root -v pg_dwh_openaq_data:/var/lib/postgresql/data postgres:latest
+
+jdbc:postgresql://localhost:5435/pg_dwh_openaq
+
+requirements:
+1. pip freeze > requirements.txt
+2.  pip install -r requirements.txt
+
