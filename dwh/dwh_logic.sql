@@ -1,10 +1,11 @@
 -- =========================================================
 -- DWH bootstrap (schemas, roles, meta, ETL utilities, model)
 -- Target DB: pg_dwh_openaq (PostgreSQL 13+)
+-- Corrected version
 -- =========================================================
 BEGIN;
 
--- ---------- 0) Extensions (безпечні)
+-- ---------- 0) Extensions
 CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
 
 -- ---------- 1) Schemas
@@ -17,7 +18,7 @@ CREATE SCHEMA IF NOT EXISTS svc;   -- мета, сервісні в’ю/агр�
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'etl') THEN
-    CREATE USER etl WITH PASSWORD 'etl';
+    CREATE ROLE etl LOGIN PASSWORD 'etl';
   END IF;
 END$$;
 
@@ -30,7 +31,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA stg
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO etl;
 ALTER DEFAULT PRIVILEGES IN SCHEMA stg
   GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO etl;
-
 
 -- ---------- 3) svc.Мета та логування
 CREATE TABLE IF NOT EXISTS svc.etl_run (
@@ -67,52 +67,55 @@ CREATE TABLE IF NOT EXISTS svc.error_log (
   detail      TEXT
 );
 
--- ---------- 4) STAGING приклад (JSON/CSV сирі записи)
--- (для OpenAQ або будь-якого сенсорного фіда)
+-- ---------- 4) STAGING (JSON/CSV сирі записи)
 CREATE TABLE IF NOT EXISTS stg.measurements_raw (
-  load_id     UUID      NOT NULL,         -- зовнішній ідентифікатор завантаження
-  src         TEXT      NOT NULL,         -- назва джерела
-  payload     JSONB     NOT NULL,         -- сирий JSON рядок (один вимір)
-  loaded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  raw_id       BIGSERIAL PRIMARY KEY,
+  load_id      UUID        NOT NULL,         -- зовнішній ідентифікатор завантаження
+  src          TEXT        NOT NULL,         -- назва джерела
+  payload      JSONB       NOT NULL,         -- сирий JSON рядок (один вимір)
+  loaded_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_stg_meas_loaded_at ON stg.measurements_raw(loaded_at);
 CREATE INDEX IF NOT EXISTS ix_stg_meas_src       ON stg.measurements_raw(src);
+CREATE INDEX IF NOT EXISTS ix_stg_meas_load_id   ON stg.measurements_raw(load_id);
 
 -- Додатково: трекінг завантажених файлів/викликів (для ідемпотентності)
 CREATE TABLE IF NOT EXISTS stg.load_registry (
-  load_id     UUID PRIMARY KEY,
-  src         TEXT NOT NULL,
-  src_ref     TEXT,                 -- ім'я файлу/URL/offset
-  started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  finished_at TIMESTAMPTZ,
-  status      TEXT NOT NULL DEFAULT 'running',
-  rows_ingested BIGINT NOT NULL DEFAULT 0,
-  checksum    TEXT
+  load_id        UUID PRIMARY KEY,
+  src            TEXT NOT NULL,
+  src_ref        TEXT,                 -- ім'я файлу/URL/offset
+  started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at    TIMESTAMPTZ,
+  status         TEXT NOT NULL DEFAULT 'running',
+  rows_ingested  BIGINT NOT NULL DEFAULT 0,
+  checksum       TEXT
 );
 
 -- ---------- 5) PROC нормалізація (flat таблиця)
 CREATE TABLE IF NOT EXISTS proc.measurements_clean (
+  clean_id            BIGSERIAL PRIMARY KEY,
   -- бізнес-ключі
-  src               TEXT NOT NULL,
-  external_id       TEXT,            -- якщо приходить ідентифікатор
-  measured_at_utc   TIMESTAMPTZ NOT NULL,
-  location_name     TEXT,
-  latitude          DOUBLE PRECISION,
-  longitude         DOUBLE PRECISION,
-  parameter_code    TEXT NOT NULL,   -- pm25, pm10, no2, o3...
-  unit              TEXT NOT NULL,   -- µg/m³, ppm...
-  value_num         DOUBLE PRECISION,
+  src                 TEXT NOT NULL,
+  external_id         TEXT,
+  dedup_key           TEXT NOT NULL,
+  measured_at_utc     TIMESTAMPTZ NOT NULL,
+  location_name       TEXT,
+  latitude            DOUBLE PRECISION,
+  longitude           DOUBLE PRECISION,
+  parameter_code      TEXT NOT NULL,   -- pm25, pm10, no2, o3...
+  unit                TEXT NOT NULL,   -- µg/m³, ppm...
+  value_num           DOUBLE PRECISION,
   -- технічні
-  load_id           UUID NOT NULL,
-  inserted_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT uq_clean UNIQUE (src, external_id, measured_at_utc, parameter_code)
+  load_id             UUID NOT NULL,
+  inserted_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_clean_dedup UNIQUE (dedup_key)
 );
 CREATE INDEX IF NOT EXISTS ix_clean_measured_at ON proc.measurements_clean(measured_at_utc);
 CREATE INDEX IF NOT EXISTS ix_clean_param       ON proc.measurements_clean(parameter_code);
 CREATE INDEX IF NOT EXISTS ix_clean_loc         ON proc.measurements_clean(location_name);
+CREATE INDEX IF NOT EXISTS ix_clean_load_id     ON proc.measurements_clean(load_id);
 
 -- ---------- 6) DM: довідники (dimensions)
--- dim_date (мінімальний)
 CREATE TABLE IF NOT EXISTS dm.dim_date (
   date_id        DATE PRIMARY KEY,     -- YYYY-MM-DD
   year           INT  NOT NULL,
@@ -123,17 +126,15 @@ CREATE TABLE IF NOT EXISTS dm.dim_date (
   iso_week       INT  NOT NULL
 );
 
--- dim_location
 CREATE TABLE IF NOT EXISTS dm.dim_location (
   location_sk    BIGSERIAL PRIMARY KEY,
   location_name  TEXT NOT NULL,
   latitude       DOUBLE PRECISION,
   longitude      DOUBLE PRECISION,
   src            TEXT,
-  CONSTRAINT uq_dim_location UNIQUE (src, location_name)
+  CONSTRAINT uq_dim_location UNIQUE (src, location_name, latitude, longitude)
 );
 
--- dim_parameter
 CREATE TABLE IF NOT EXISTS dm.dim_parameter (
   parameter_sk   SMALLSERIAL PRIMARY KEY,
   parameter_code TEXT NOT NULL UNIQUE,     -- pm25/pm10/...
@@ -142,14 +143,16 @@ CREATE TABLE IF NOT EXISTS dm.dim_parameter (
 
 -- ---------- 7) FACT із партиціюванням по місяцях
 CREATE TABLE IF NOT EXISTS dm.fact_measurement (
-  fact_id        BIGSERIAL,
-  date_id        DATE NOT NULL REFERENCES dm.dim_date(date_id),
-  location_sk    BIGINT NOT NULL REFERENCES dm.dim_location(location_sk),
-  parameter_sk   SMALLINT NOT NULL REFERENCES dm.dim_parameter(parameter_sk),
-  measured_at_utc TIMESTAMPTZ NOT NULL,
-  value_num      DOUBLE PRECISION,
-  load_id        UUID NOT NULL,
-  PRIMARY KEY (fact_id, date_id)
+  fact_id          BIGSERIAL,
+  date_id          DATE NOT NULL REFERENCES dm.dim_date(date_id),
+  location_sk      BIGINT NOT NULL REFERENCES dm.dim_location(location_sk),
+  parameter_sk     SMALLINT NOT NULL REFERENCES dm.dim_parameter(parameter_sk),
+  measured_at_utc  TIMESTAMPTZ NOT NULL,
+  value_num        DOUBLE PRECISION,
+  load_id          UUID NOT NULL,
+  fact_dedup_key   TEXT NOT NULL,
+  PRIMARY KEY (fact_id, date_id),
+  CONSTRAINT uq_fact_measurement UNIQUE (date_id, location_sk, parameter_sk, measured_at_utc, fact_dedup_key)
 ) PARTITION BY RANGE (date_id);
 
 -- функція створення партиції на місяць
@@ -162,9 +165,12 @@ DECLARE
   sql     TEXT;
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_class c
-    JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE c.relkind='r' AND n.nspname='dm' AND c.relname = part
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname = 'dm'
+      AND c.relname = part
   ) THEN
     sql := format(
       'CREATE TABLE dm.%I PARTITION OF dm.fact_measurement
@@ -191,103 +197,183 @@ ON CONFLICT (date_id) DO NOTHING;
 $$;
 
 -- ---------- 9) Трансформація: із stg -> proc (JSON приклад)
-CREATE OR REPLACE FUNCTION proc.normalize_from_raw(p_run_id UUID DEFAULT NULL)
+-- За замовчуванням обробляє лише нові load_id зі stg.load_registry зі status='ok'
+-- і які ще не були нормалізовані в proc.measurements_clean.
+CREATE OR REPLACE FUNCTION proc.normalize_from_raw(
+  p_run_id UUID DEFAULT NULL,
+  p_load_id UUID DEFAULT NULL
+)
 RETURNS BIGINT LANGUAGE plpgsql AS $$
 DECLARE
   v_cnt BIGINT := 0;
 BEGIN
   INSERT INTO proc.measurements_clean(
-    src, external_id, measured_at_utc, location_name, latitude, longitude,
-    parameter_code, unit, value_num, load_id
+    src,
+    external_id,
+    dedup_key,
+    measured_at_utc,
+    location_name,
+    latitude,
+    longitude,
+    parameter_code,
+    unit,
+    value_num,
+    load_id
   )
   SELECT
     r.src,
-    COALESCE(r.payload->>'id', r.payload->>'uuid'),
+    COALESCE(r.payload->>'id', r.payload->>'uuid') AS external_id,
+    md5(
+      COALESCE(r.src, '') || '|' ||
+      COALESCE(r.payload->>'id', r.payload->>'uuid', '') || '|' ||
+      COALESCE(r.payload->>'date_utc', '') || '|' ||
+      COALESCE(r.payload->>'location', '') || '|' ||
+      COALESCE(r.payload->>'parameter', '') || '|' ||
+      COALESCE(r.payload->>'value', '')
+    ) AS dedup_key,
     (r.payload->>'date_utc')::timestamptz,
     r.payload->>'location',
-    NULLIF(r.payload->>'lat','')::float8,
-    NULLIF(r.payload->>'lon','')::float8,
+    NULLIF(r.payload->>'lat', '')::float8,
+    NULLIF(r.payload->>'lon', '')::float8,
     r.payload->>'parameter',
     r.payload->>'unit',
-    NULLIF(r.payload->>'value','')::float8,
+    NULLIF(r.payload->>'value', '')::float8,
     r.load_id
   FROM stg.measurements_raw r
-  LEFT JOIN proc.measurements_clean c
-    ON c.src = r.src
-   AND c.external_id = COALESCE(r.payload->>'id', r.payload->>'uuid')
-   AND c.measured_at_utc = (r.payload->>'date_utc')::timestamptz
-   AND c.parameter_code   = (r.payload->>'parameter')
-  WHERE c.src IS NULL                         -- ідемпотентність
-    AND (r.payload->>'date_utc') IS NOT NULL  -- базова валідація
-    AND (r.payload->>'parameter') IS NOT NULL;
+  WHERE (r.payload->>'date_utc') IS NOT NULL
+    AND (r.payload->>'parameter') IS NOT NULL
+    AND (
+      p_load_id IS NOT NULL
+      AND r.load_id = p_load_id
+      OR
+      p_load_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM stg.load_registry lr
+        WHERE lr.load_id = r.load_id
+          AND lr.status = 'ok'
+      )
+    )
+  ON CONFLICT (dedup_key) DO NOTHING;
 
   GET DIAGNOSTICS v_cnt = ROW_COUNT;
 
   IF p_run_id IS NOT NULL THEN
-    UPDATE svc.etl_run SET rows_out = rows_out + v_cnt WHERE run_id = p_run_id;
+    UPDATE svc.etl_run
+       SET rows_out = rows_out + v_cnt
+     WHERE run_id = p_run_id;
   END IF;
 
   RETURN v_cnt;
 EXCEPTION WHEN OTHERS THEN
   INSERT INTO svc.error_log(run_id, task_name, phase, context, message, detail)
-  VALUES (p_run_id, 'normalize_from_raw', 'transform', NULL, SQLERRM, SQLSTATE);
+  VALUES (
+    p_run_id,
+    'normalize_from_raw',
+    'transform',
+    jsonb_build_object('load_id', p_load_id),
+    SQLERRM,
+    SQLSTATE
+  );
   RAISE;
 END$$;
 
 -- ---------- 10) Завантаження в DM (upsert dims + fact)
-CREATE OR REPLACE FUNCTION dm.load_star_from_clean(p_run_id UUID DEFAULT NULL)
+CREATE OR REPLACE FUNCTION dm.load_star_from_clean(
+  p_run_id UUID DEFAULT NULL,
+  p_load_id UUID DEFAULT NULL
+)
 RETURNS BIGINT LANGUAGE plpgsql AS $$
 DECLARE
   v_cnt BIGINT := 0;
+  v_min_date DATE;
+  v_max_date DATE;
+  v_date DATE;
 BEGIN
   -- 1) параметри
   INSERT INTO dm.dim_parameter(parameter_code, unit_default)
-  SELECT DISTINCT parameter_code, unit
-  FROM proc.measurements_clean
+  SELECT DISTINCT c.parameter_code, c.unit
+  FROM proc.measurements_clean c
+  WHERE p_load_id IS NULL OR c.load_id = p_load_id
   ON CONFLICT (parameter_code) DO NOTHING;
 
   -- 2) локації
   INSERT INTO dm.dim_location(location_name, latitude, longitude, src)
-  SELECT DISTINCT location_name, latitude, longitude, src
-  FROM proc.measurements_clean
-  WHERE location_name IS NOT NULL
-  ON CONFLICT (src, location_name) DO NOTHING;
+  SELECT DISTINCT c.location_name, c.latitude, c.longitude, c.src
+  FROM proc.measurements_clean c
+  WHERE c.location_name IS NOT NULL
+    AND (p_load_id IS NULL OR c.load_id = p_load_id)
+  ON CONFLICT (src, location_name, latitude, longitude) DO NOTHING;
 
-  -- 3) date dimension (за діапазоном дат із clean)
-  PERFORM dm.populate_dim_date(
-    (SELECT date_trunc('day', min(measured_at_utc))::date FROM proc.measurements_clean),
-    (SELECT date_trunc('day', max(measured_at_utc))::date FROM proc.measurements_clean)
-  );
+  -- 3) date dimension (лише за діапазоном дат поточного набору)
+  SELECT
+    date_trunc('day', min(c.measured_at_utc))::date,
+    date_trunc('day', max(c.measured_at_utc))::date
+  INTO v_min_date, v_max_date
+  FROM proc.measurements_clean c
+  WHERE p_load_id IS NULL OR c.load_id = p_load_id;
 
-  -- 4) FACT + створення партицій
-  WITH ins AS (
-    SELECT
-      date_trunc('day', c.measured_at_utc)::date AS date_id,
-      (SELECT location_sk FROM dm.dim_location dl
-         WHERE dl.src=c.src AND dl.location_name=c.location_name
-         ORDER BY location_sk LIMIT 1) AS location_sk,
-      (SELECT parameter_sk FROM dm.dim_parameter dp
-         WHERE dp.parameter_code=c.parameter_code) AS parameter_sk,
-      c.measured_at_utc, c.value_num, c.load_id
+  IF v_min_date IS NOT NULL AND v_max_date IS NOT NULL THEN
+    PERFORM dm.populate_dim_date(v_min_date, v_max_date);
+  END IF;
+
+  -- 4) створення потрібних партицій
+  FOR v_date IN
+    SELECT DISTINCT date_trunc('day', c.measured_at_utc)::date AS date_id
     FROM proc.measurements_clean c
-  )
-  SELECT dm.ensure_month_partition(date_id) FROM (SELECT DISTINCT date_id FROM ins) d;
+    WHERE p_load_id IS NULL OR c.load_id = p_load_id
+  LOOP
+    PERFORM dm.ensure_month_partition(v_date);
+  END LOOP;
 
-  INSERT INTO dm.fact_measurement(date_id, location_sk, parameter_sk, measured_at_utc, value_num, load_id)
-  SELECT date_id, location_sk, parameter_sk, measured_at_utc, value_num, load_id
-  FROM ins
-  WHERE location_sk IS NOT NULL AND parameter_sk IS NOT NULL;
+  -- 5) FACT
+  INSERT INTO dm.fact_measurement(
+    date_id,
+    location_sk,
+    parameter_sk,
+    measured_at_utc,
+    value_num,
+    load_id,
+    fact_dedup_key
+  )
+  SELECT
+    date_trunc('day', c.measured_at_utc)::date AS date_id,
+    dl.location_sk,
+    dp.parameter_sk,
+    c.measured_at_utc,
+    c.value_num,
+    c.load_id,
+    c.dedup_key
+  FROM proc.measurements_clean c
+  JOIN dm.dim_location dl
+    ON dl.src = c.src
+   AND dl.location_name = c.location_name
+   AND dl.latitude IS NOT DISTINCT FROM c.latitude
+   AND dl.longitude IS NOT DISTINCT FROM c.longitude
+  JOIN dm.dim_parameter dp
+    ON dp.parameter_code = c.parameter_code
+  WHERE p_load_id IS NULL OR c.load_id = p_load_id
+  ON CONFLICT (date_id, location_sk, parameter_sk, measured_at_utc, fact_dedup_key) DO NOTHING;
 
   GET DIAGNOSTICS v_cnt = ROW_COUNT;
 
   IF p_run_id IS NOT NULL THEN
-    UPDATE svc.etl_run SET rows_out = rows_out + v_cnt WHERE run_id = p_run_id;
+    UPDATE svc.etl_run
+       SET rows_out = rows_out + v_cnt
+     WHERE run_id = p_run_id;
   END IF;
 
   RETURN v_cnt;
 EXCEPTION WHEN OTHERS THEN
   INSERT INTO svc.error_log(run_id, task_name, phase, context, message, detail)
-  VALUES (p_run_id, 'load_star_from_clean', 'load', NULL, SQLERRM, SQLSTATE);
+  VALUES (
+    p_run_id,
+    'load_star_from_clean',
+    'load',
+    jsonb_build_object('load_id', p_load_id),
+    SQLERRM,
+    SQLSTATE
+  );
   RAISE;
 END$$;
 
@@ -306,17 +392,27 @@ FROM dm.fact_measurement f
 JOIN dm.dim_location  l ON l.location_sk = f.location_sk
 JOIN dm.dim_parameter p ON p.parameter_sk = f.parameter_sk
 GROUP BY f.date_id, l.location_name, p.parameter_code;
--- індекси для MV
-CREATE INDEX IF NOT EXISTS ix_mv_daily ON svc.mv_daily_agg(date_id, location_name, parameter_code);
+
+-- унікальний індекс потрібен для REFRESH MATERIALIZED VIEW CONCURRENTLY
+CREATE UNIQUE INDEX IF NOT EXISTS ux_mv_daily
+  ON svc.mv_daily_agg(date_id, location_name, parameter_code);
 
 -- Актуальний сервісний в’ю для BI
 CREATE OR REPLACE VIEW svc.vw_fact_measurement AS
 SELECT
   f.measured_at_utc,
   f.value_num,
-  d.date_id, d.year, d.month, d.day,
-  l.location_sk, l.location_name, l.latitude, l.longitude,
-  p.parameter_code, p.unit_default
+  d.date_id,
+  d.year,
+  d.month,
+  d.day,
+  l.location_sk,
+  l.location_name,
+  l.latitude,
+  l.longitude,
+  p.parameter_code,
+  p.unit_default,
+  f.load_id
 FROM dm.fact_measurement f
 JOIN dm.dim_date      d ON d.date_id = f.date_id
 JOIN dm.dim_location  l ON l.location_sk = f.location_sk
@@ -325,42 +421,68 @@ JOIN dm.dim_parameter p ON p.parameter_sk = f.parameter_sk;
 -- ---------- 12) Індексні підсилення
 CREATE INDEX IF NOT EXISTS ix_fact_measured_at ON dm.fact_measurement USING BRIN(measured_at_utc);
 CREATE INDEX IF NOT EXISTS ix_fact_loc_param   ON dm.fact_measurement(location_sk, parameter_sk);
+CREATE INDEX IF NOT EXISTS ix_fact_load_id     ON dm.fact_measurement(load_id);
 
 -- ---------- 13) Мінімальні ETL-ранери (start/finish)
 CREATE OR REPLACE FUNCTION svc.start_run(p_pipeline TEXT)
 RETURNS UUID LANGUAGE sql AS $$
-  INSERT INTO svc.etl_run(pipeline_name) VALUES (p_pipeline) RETURNING run_id;
+  INSERT INTO svc.etl_run(pipeline_name)
+  VALUES (p_pipeline)
+  RETURNING run_id;
 $$;
 
-CREATE OR REPLACE FUNCTION svc.finish_run(p_run_id UUID, p_status TEXT DEFAULT 'ok', p_msg TEXT DEFAULT NULL)
+CREATE OR REPLACE FUNCTION svc.finish_run(
+  p_run_id UUID,
+  p_status TEXT DEFAULT 'ok',
+  p_msg TEXT DEFAULT NULL
+)
 RETURNS VOID LANGUAGE sql AS $$
   UPDATE svc.etl_run
-     SET finished_at = now(), status = p_status, msg = COALESCE(msg,'') || COALESCE(' | '||p_msg,'')
+     SET finished_at = now(),
+         status = p_status,
+         msg = CASE
+                 WHEN p_msg IS NULL THEN msg
+                 WHEN msg IS NULL OR msg = '' THEN p_msg
+                 ELSE msg || ' | ' || p_msg
+               END
    WHERE run_id = p_run_id;
 $$;
 
 -- ---------- 14) Приклад end-to-end ETL (викликається з cron/Airflow)
 -- SELECT * FROM svc.etl_end_to_end('openaq_hourly');
-CREATE OR REPLACE FUNCTION svc.etl_end_to_end(p_pipeline TEXT)
+CREATE OR REPLACE FUNCTION svc.etl_end_to_end(
+  p_pipeline TEXT,
+  p_load_id UUID DEFAULT NULL
+)
 RETURNS TABLE(step TEXT, affected BIGINT) LANGUAGE plpgsql AS $$
 DECLARE
   v_run UUID;
-  v1 BIGINT; v2 BIGINT;
+  v1 BIGINT;
+  v2 BIGINT;
 BEGIN
   v_run := svc.start_run(p_pipeline);
+
   BEGIN
     -- 1) нормалізація
-    v1 := proc.normalize_from_raw(v_run);
+    v1 := proc.normalize_from_raw(v_run, p_load_id);
     RETURN QUERY SELECT 'normalize_from_raw', v1;
 
     -- 2) завантаження в DM
-    v2 := dm.load_star_from_clean(v_run);
+    v2 := dm.load_star_from_clean(v_run, p_load_id);
     RETURN QUERY SELECT 'load_star_from_clean', v2;
 
     PERFORM svc.finish_run(v_run, 'ok', 'done');
   EXCEPTION WHEN OTHERS THEN
-    INSERT INTO svc.error_log(run_id, task_name, phase, message, detail)
-    VALUES (v_run, 'etl_end_to_end', 'overall', SQLERRM, SQLSTATE);
+    INSERT INTO svc.error_log(run_id, task_name, phase, context, message, detail)
+    VALUES (
+      v_run,
+      'etl_end_to_end',
+      'overall',
+      jsonb_build_object('load_id', p_load_id),
+      SQLERRM,
+      SQLSTATE
+    );
+
     PERFORM svc.finish_run(v_run, 'failed', SQLERRM);
     RAISE;
   END;
@@ -370,12 +492,24 @@ COMMIT;
 
 -- ================== Корисні нотатки ==================
 -- 1) Завантаження сирих даних:
--- INSERT INTO stg.load_registry(load_id, src, src_ref, status) VALUES ('00000000-0000-0000-0000-000000000001','openaq','page=1','running');
--- INSERT INTO stg.measurements_raw(load_id, src, payload) VALUES ('00000000-0000-0000-0000-000000000001','openaq','{...json...}');
--- UPDATE stg.load_registry SET status='ok', finished_at=now(), rows_ingested=1234 WHERE load_id='00000000-0000-0000-0000-000000000001';
+-- INSERT INTO stg.load_registry(load_id, src, src_ref, status)
+-- VALUES ('00000000-0000-0000-0000-000000000001','openaq','page=1','running');
+
+-- INSERT INTO stg.measurements_raw(load_id, src, payload)
+-- VALUES ('00000000-0000-0000-0000-000000000001','openaq','{...json...}');
+
+-- UPDATE stg.load_registry
+--    SET status='ok', finished_at=now(), rows_ingested=1234
+--  WHERE load_id='00000000-0000-0000-0000-000000000001';
 
 -- 2) Запуск повного ETL:
 -- SELECT * FROM svc.etl_end_to_end('openaq_hourly');
+
+-- Або точково по одному load_id:
+-- SELECT * FROM svc.etl_end_to_end(
+--   'openaq_hourly',
+--   '00000000-0000-0000-0000-000000000001'
+-- );
 
 -- 3) Рефреш денного MV (по завершенню ETL):
 -- REFRESH MATERIALIZED VIEW CONCURRENTLY svc.mv_daily_agg;
